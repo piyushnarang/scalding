@@ -19,6 +19,7 @@ import cascading.flow.FlowException
 import cascading.pipe.joiner.{ JoinerClosure, InnerJoin }
 import cascading.tap.Tap
 import cascading.tuple.{ Fields, Tuple }
+import com.twitter.algebird.Semigroup
 
 import com.twitter.scalding._
 import com.twitter.scalding.source.{ FixedTypedText, NullSink, TypedText }
@@ -26,13 +27,8 @@ import com.twitter.scalding.serialization.OrderedSerialization
 import java.util.{ Iterator => JIterator }
 import org.scalacheck.{ Arbitrary, Gen }
 import org.scalatest.{ Matchers, WordSpec }
-import org.slf4j.{ LoggerFactory, Logger }
 import scala.collection.JavaConverters._
 import scala.language.experimental.macros
-import scala.math.Ordering
-import scala.util.Failure
-import scala.util.Success
-import scala.util.Try
 
 class InAndOutJob(args: Args) extends Job(args) {
   Tsv("input").read.write(Tsv("output"))
@@ -65,6 +61,71 @@ class TinyJoinAndMergeJob(args: Args) extends Job(args) {
   val mergerData = mergerInput.read.mapTo(0 -> 'id) { v: Int => v }
 
   (mergerData ++ joinedData).groupBy('id) { _.size('count) }.write(output)
+}
+
+/**
+  * Merges two instances of the same edge. This is a bit strange because it's more accurate to think
+  * of a semigroup over edge properties (we're not merging edge properties over different edges, just
+  * instances of the same edge). This is just a thin convenience wrapper around the type-specific
+  * edge properties semigroups that allows, for example, multiple edge types to be merged in a single
+  * Scalding map reduce step where you can only specify a single semigroup.
+  */
+object GenericEdgeSemigroup extends Semigroup[(String, String, Seq[String])] {
+  override def plus(l: (String, String, Seq[String]), r: (String, String, Seq[String])): (String, String, Seq[String]) = {
+    require(l._1 == r._1)
+    require(l._2 == r._2)
+    l
+  }
+}
+
+
+object FullEdgeAppBaseJob {
+  def mergeEdges(edges: TypedPipe[(String, String, Seq[String])]): TypedPipe[(String, String, Seq[String])] = {
+    edges.groupBy(x => (x._1, x._2))
+      .sum(GenericEdgeSemigroup)
+      .values
+  }
+  val output = TypedTsv[((String, String), (Option[(String, String, Seq[String])], Unit))]("output")
+  val output2 = TypedTsv[((String, String), (String, String, Seq[String]))]("output2")
+  val output3 = TypedTsv[(String, String)]("output2")
+
+  val previousData = List( ("A", "B", Seq("1", "2")),  ("B", "C", Seq("3", "4")), ("B", "D", Seq("5", "6")), ("A", "D",Seq("1", "2")))
+  val incrementalData = List()
+  val backfillData = List()
+  val deletedUsers = List("1", "2")
+}
+
+class FullEdgeAppBaseJob(args: Args) extends Job(args) {
+  import FullEdgeAppBaseJob._
+
+  val previousTP: TypedPipe[(String, String, Seq[String])] = TypedPipe.from(previousData)
+  val deletedTP: TypedPipe[String] = TypedPipe.from(deletedUsers)
+
+  val mergedEdges =
+    previousTP
+    .groupBy(x => (x._1, x._2))
+    .mapValueStream(x => x) //needed for failure
+    .values
+//    .forceToDisk //adding this line fixes things
+
+  val edgesToDel =
+    mergedEdges
+      .flatMap { edgeTuple =>
+        edgeTuple._3.map { userId =>
+          (userId, edgeTuple)
+        }
+      }
+      .join(deletedTP.asKeys)
+      .toTypedPipe
+      .map { case (userId, ((idA, idB, userIDSeq), meh)) => (idA, idB) }
+//    .forceToDisk //adding this line fixes things too
+
+    mergedEdges
+      .groupBy(x => (x._1, x._2))
+      .rightJoin(edgesToDel.asKeys) //this is needed for the failure
+//        .mapValues{ case Some(x) => x }
+      .toTypedPipe
+      .write(output)
 }
 
 // Verifies fix for https://github.com/cwensel/cascading/pull/53
@@ -586,6 +647,20 @@ class PlatformTest extends WordSpec with Matchers with HadoopSharedPlatformTest 
           val steps = flow.getFlowSteps.asScala
           steps should have size 1
         }
+        .run()
+    }
+  }
+
+  "A FullEdgeAppBase job" should {
+    import FullEdgeAppBaseJob._
+
+    "not blow up" in {
+      HadoopPlatformJobTest(new FullEdgeAppBaseJob(_), cluster)
+//          .source(previousData)
+//        .source(previous, previousData)
+//        .source(incremental, incrementalData)
+//        .source(backfill, backfillData)
+//        .sink(output) { _.toSet shouldBe (outputData.toSet) }
         .run()
     }
   }
