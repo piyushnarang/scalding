@@ -15,22 +15,17 @@ limitations under the License.
  */
 package com.twitter.scalding
 
-import com.twitter.algebird.monad.{ Reader, Trampoline }
+import cascading.flow.{ FlowDef, Flow }
+import com.twitter.algebird.monad.Trampoline
 import com.twitter.algebird.{ Monoid, Monad, Semigroup }
 import com.twitter.scalding.cascading_interop.FlowListenerPromise
 import com.twitter.scalding.filecache.{CachedFile, DistributedCacheFile}
-import com.twitter.scalding.Dsl.flowDefToRichFlowDef
-import java.util.concurrent.LinkedBlockingQueue
-import scala.concurrent.{ Await, Future, ExecutionContext => ConcurrentExecutionContext, Promise }
-import scala.util.{ Failure, Success, Try }
-import scala.util.control.NonFatal
-import cascading.flow.{ FlowDef, Flow }
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{ FileSystem, Path }
-import org.slf4j.LoggerFactory
-
+import com.twitter.scalding.typed.cascading_backend.AsyncFlowDefRunner
+import java.util.UUID
 import scala.collection.mutable
+import scala.concurrent.{ Await, Future, ExecutionContext => ConcurrentExecutionContext, Promise }
 import scala.runtime.ScalaRunTime
+import scala.util.{ Failure, Success, Try }
 
 /**
  * Execution[T] represents and computation that can be run and
@@ -148,14 +143,15 @@ sealed trait Execution[+T] extends java.io.Serializable { self: Product =>
    * Seriously: pro-style is for this to be called only once in a program.
    */
   final def run(conf: Config, mode: Mode)(implicit cec: ConcurrentExecutionContext): Future[T] = {
-    val ec = new EvalCache
-    val confWithId = conf.setScaldingExecutionId(java.util.UUID.randomUUID.toString)
+    val writer: Execution.Writer = new AsyncFlowDefRunner
+    val ec = new EvalCache(writer)
+    val confWithId = conf.setScaldingExecutionId(UUID.randomUUID.toString)
     // get on Trampoline
     val result = runStats(confWithId, mode, ec)(cec).get.map(_._1)
     // When the final future in complete we stop the submit thread
-    result.onComplete { _ => ec.finished(mode) }
+    result.onComplete { _ => writer.finished() }
     // wait till the end to start the thread in case the above throws
-    ec.start()
+    writer.start()
     result
   }
 
@@ -310,137 +306,19 @@ object Execution {
   }
 
   /**
-    * This is a Thread used as a shutdown hook to clean up temporary files created by some Execution
-    *
-    * If the job is aborted the shutdown hook may not run and the temporary files will not get cleaned up
-    */
-  private[scalding] case class TempFileCleanup(filesToCleanup: Iterable[String], mode: Mode) extends Thread {
-    val LOG = LoggerFactory.getLogger(this.getClass)
-
-    override def run(): Unit = {
-      val fs = mode match {
-        case localMode: CascadingLocal => FileSystem.getLocal(new Configuration)
-        case hdfsMode: HadoopMode =>  FileSystem.get(hdfsMode.jobConf)
-      }
-
-      filesToCleanup.foreach { file: String =>
-        try {
-          val path = new Path(file)
-          if (fs.exists(path)) {
-            // The "true" parameter here indicates that we should recursively delete everything under the given path
-            fs.delete(path, true)
-          }
-        } catch {
-          // If we fail in deleting a temp file, log the error but don't fail the run
-          case e: Throwable => LOG.warn(s"Unable to delete temp file $file", e)
-        }
-      }
-    }
-  }
-
-  /**
    * This is a mutable state that is kept internal to an execution
    * as it is evaluating.
    */
-  private[scalding] object EvalCache {
-    /**
-     * We send messages from other threads into the submit thread here
-     */
-    private[EvalCache] sealed trait FlowDefAction
-    private[EvalCache] case class RunFlowDef(conf: Config,
-      mode: Mode,
-      fd: FlowDef,
-      result: Promise[(Long, JobStats)]) extends FlowDefAction
-    private[EvalCache] case object Stop extends FlowDefAction
-  }
-
-  private[scalding] class EvalCache {
-    import EvalCache._
+  private[scalding] class EvalCache(val writer: Execution.Writer) {
 
     type Counters = Map[Long, ExecutionCounters]
     private[this] val cache = new FutureCache[(Config, Execution[Any]), (Any, Counters)]
     private[this] val toWriteCache = new FutureCache[(Config, ToWrite), Counters]
-    private[this] val filesToCleanup = mutable.Set[String]()
 
     // This method with return a 'clean' cache, that shares
     // the underlying thread and message queue of the parent evalCache
-    def cleanCache: EvalCache = {
-      val self = this
-      new EvalCache {
-        override protected[EvalCache] val messageQueue: LinkedBlockingQueue[EvalCache.FlowDefAction] = self.messageQueue
-        override def addFilesToCleanup(files: TraversableOnce[String]): Unit = self.addFilesToCleanup(files)
-        override def start(): Unit = sys.error("Invalid to start child EvalCache")
-        override def finished(mode: Mode): Unit = sys.error("Invalid to finish child EvalCache")
-      }
-    }
-
-    protected[EvalCache] val messageQueue = new LinkedBlockingQueue[EvalCache.FlowDefAction]()
-    /**
-     * Hadoop and/or cascading has some issues, it seems, with starting jobs
-     * from multiple threads. This thread does all the Flow starting.
-     */
-    protected lazy val thread = new Thread(new Runnable {
-      def run(): Unit = {
-        @annotation.tailrec
-        def go(id: Long): Unit = messageQueue.take match {
-          case Stop => ()
-          case RunFlowDef(conf, mode, fd, promise) =>
-            try {
-              val ctx = ExecutionContext.newContext(conf)(fd, mode)
-              ctx.buildFlow match {
-                case Success(flow) =>
-                  promise.completeWith(Execution.run(id, flow))
-                case Failure(err) =>
-                  promise.failure(err)
-              }
-            } catch {
-              case t: Throwable =>
-                // something bad happened, but this thread is a daemon
-                // that should only stop if all others have stopped or
-                // we have received the stop message.
-                // Stopping this thread prematurely can deadlock
-                // futures from the promise we have.
-                // In a sense, this thread does not exist logically and
-                // must forward all exceptions to threads that requested
-                // this work be started.
-                promise.tryFailure(t)
-            }
-            // Loop
-            go(id + 1)
-        }
-
-        // Now we actually run the recursive loop
-        go(0)
-      }
-    })
-
-    def runFlowDef(conf: Config, mode: Mode, fd: FlowDef): Future[(Long, JobStats)] =
-      try {
-        val promise = Promise[(Long, JobStats)]()
-        val fut = promise.future
-        messageQueue.put(RunFlowDef(conf, mode, fd, promise))
-        // Don't do any work after the .put call, we want no chance for exception
-        // after the put
-        fut
-      } catch {
-        case NonFatal(e) =>
-          Future.failed(e)
-      }
-
-    def start(): Unit = {
-      // Make sure this thread can't keep us running if all others are gone
-      thread.setDaemon(true)
-      thread.start()
-    }
-    /*
-     * This is called after we are done submitting all jobs
-     */
-    def finished(mode: Mode): Unit = {
-      messageQueue.put(Stop)
-      if (filesToCleanup.nonEmpty) {
-        Runtime.getRuntime.addShutdownHook(TempFileCleanup(filesToCleanup, mode))
-      }
-    }
+    def cleanCache: EvalCache =
+      new EvalCache(writer)
 
     def getOrLock(cfg: Config, write: ToWrite): Either[Promise[Counters], Future[Counters]] =
       toWriteCache.getOrPromise((cfg, write))
@@ -454,10 +332,6 @@ object Execution {
     def getOrElseInsert[T](cfg: Config, ex: Execution[T],
       res: => Future[(T, Counters)]): Future[(T, Counters)] =
       getOrElseInsertWithFeedback(cfg, ex, res)._2
-
-    def addFilesToCleanup(files: TraversableOnce[String]): Unit = filesToCleanup.synchronized {
-      filesToCleanup ++= files
-    }
   }
 
   private case class FutureConst[T](get: ConcurrentExecutionContext => Future[T]) extends Execution[T] {
@@ -490,6 +364,7 @@ object Execution {
           fut.map { case (s, stats) => (fn(s), stats) })
       }
   }
+
   private case class GetCounters[T](prev: Execution[T]) extends Execution[(T, ExecutionCounters)] {
     protected def runStats(conf: Config, mode: Mode, cache: EvalCache)(implicit cec: ConcurrentExecutionContext) =
       Trampoline.call(prev.runStats(conf, mode, cache)).map { fut =>
@@ -530,9 +405,7 @@ object Execution {
    */
   private case class WithNewCache[T](prev: Execution[T]) extends Execution[T] {
     protected def runStats(conf: Config, mode: Mode, cache: EvalCache)(implicit cec: ConcurrentExecutionContext) = {
-      // Share the runner thread, but have own cache
       val ec = cache.cleanCache
-
       Trampoline.call(prev.runStats(conf, mode, ec))
     }
   }
@@ -658,13 +531,16 @@ object Execution {
    */
   private case class FlowDefExecution(result: (Config, Mode) => FlowDef) extends Execution[Unit] {
     protected def runStats(conf: Config, mode: Mode, cache: EvalCache)(implicit cec: ConcurrentExecutionContext) = {
-      lazy val future =
-        for {
-          flowDef <- toFuture(Try(result(conf, mode)))
-          _ = FlowStateMap.validateSources(flowDef, mode)
-          (id, jobStats) <- cache.runFlowDef(conf, mode, flowDef)
-          _ = FlowStateMap.clear(flowDef)
-        } yield ((), Map(id -> ExecutionCounters.fromJobStats(jobStats)))
+      lazy val future = {
+        cache.writer match {
+          case ar: AsyncFlowDefRunner =>
+            ar.validateAndRun(conf, mode)(result).map { m => ((), Map(m)) }
+          case other =>
+            Future.failed(
+              new Exception(
+                s"requires AsyncFlowDefRunner, found ${other.getClass}: $other"))
+        }
+      }
 
       Trampoline(cache.getOrElseInsert(conf, this, future))
     }
@@ -675,20 +551,56 @@ object Execution {
    * but with proof that pipe matches sink
    */
 
-  private trait ToWrite {
-    def write(config: Config, flowDef: FlowDef, mode: Mode): Unit
-  }
-  private case class SimpleWrite[T](pipe: TypedPipe[T], sink: TypedSink[T]) extends ToWrite {
-    def write(config: Config, flowDef: FlowDef, mode: Mode): Unit = {
-      // This has the side effect of mutating flowDef
-      pipe.write(sink)(flowDef, mode)
-      ()
-    }
+  sealed trait ToWrite
+  object ToWrite {
+    case class Force[T](pipe: TypedPipe[T]) extends ToWrite
+    case class ToIterable[T](pipe: TypedPipe[T]) extends ToWrite
+    case class SimpleWrite[T](pipe: TypedPipe[T], sink: TypedSink[T]) extends ToWrite
   }
 
-  private case class PreparedWrite[T](fn: (Config, Mode) => SimpleWrite[T]) extends ToWrite {
-    def write(config: Config, flowDef: FlowDef, mode: Mode): Unit =
-      fn(config, mode).write(config, flowDef, mode)
+  /**
+   * Something that can handle a batch of writes that may be optimized
+   * before running. Return a unique Long for each run and Counters
+   */
+  trait Writer {
+    /**
+     * This is called by an Execution to begin processing
+     */
+    def start(): Unit
+
+    /**
+     * This is called by an Execution to end processing
+     */
+    def finished(): Unit
+
+    /**
+     * do a batch of writes, possibly optimizing, and return a new unique
+     * Long.
+     *
+     * empty writes are legitmate and should still return a Long
+     */
+    def execute(
+      conf: Config,
+      mode: Mode,
+      writes: List[ToWrite])(implicit cec: ConcurrentExecutionContext): Future[(Long, ExecutionCounters)]
+
+    /**
+     * This should only be called after a call to execute
+     */
+    private[Execution] def getForced[T](
+      conf: Config,
+      mode: Mode,
+      initial: TypedPipe[T]
+      )(implicit cec: ConcurrentExecutionContext): Future[TypedPipe[T]]
+
+    /**
+     * This should only be called after a call to execute
+     */
+    private[Execution] def getIterable[T](
+      conf: Config,
+      mode: Mode,
+      initial: TypedPipe[T]
+      )(implicit cec: ConcurrentExecutionContext): Future[Iterable[T]]
   }
 
   /**
@@ -696,7 +608,10 @@ object Execution {
    * are based on on this one. By keeping the Pipe and the Sink, can inspect the Execution
    * DAG and optimize it later (a goal, but not done yet).
    */
-  private case class WriteExecution[T](head: ToWrite, tail: List[ToWrite], fn: (Config, Mode) => T, tempFilesToCleanup: (Config, Mode) => Set[String] = (_, _) => Set()) extends Execution[T] {
+  private case class WriteExecution[T](
+    head: ToWrite,
+    tail: List[ToWrite],
+    result: ((Config, Mode, Writer, ConcurrentExecutionContext)) => Future[T]) extends Execution[T] {
 
     /**
      * Apply a pure function to the result. This may not
@@ -706,21 +621,9 @@ object Execution {
      * Here we inline the map operation into the presentation function so we can zip after map.
      */
     override def map[U](mapFn: T => U): Execution[U] =
-      WriteExecution(head, tail, { (conf: Config, mode: Mode) => mapFn(fn(conf, mode)) })
-
-    /* Run a list of ToWrite elements */
-    private[this] def scheduleToWrites(conf: Config,
-      mode: Mode,
-      cache: EvalCache,
-      head: ToWrite,
-      tail: List[ToWrite])(implicit cec: ConcurrentExecutionContext): Future[Map[Long, ExecutionCounters]] = {
-      for {
-        flowDef <- toFuture(Try { val fd = new FlowDef; (head :: tail).foreach(_.write(conf, fd, mode)); fd })
-        _ = FlowStateMap.validateSources(flowDef, mode)
-        (id, jobStats) <- cache.runFlowDef(conf, mode, flowDef)
-        _ = FlowStateMap.clear(flowDef)
-      } yield Map(id -> ExecutionCounters.fromJobStats(jobStats))
-    }
+      WriteExecution(head,
+        tail,
+        { tup => result(tup).map(mapFn)(tup._4) })
 
     def unwrapListEither[A, B, C](it: List[(A, Either[B, C])]): (List[(A, B)], List[(A, C)]) = it match {
       case (a, Left(b)) :: tail =>
@@ -737,7 +640,6 @@ object Execution {
     // Anything not already ran we run as part of a single flow def, using their combined counters for the others
     protected def runStats(conf: Config, mode: Mode, cache: EvalCache)(implicit cec: ConcurrentExecutionContext) = {
       Trampoline(cache.getOrElseInsert(conf, this, {
-        cache.addFilesToCleanup(tempFilesToCleanup(conf, mode))
         val cacheLookup: List[(ToWrite, Either[Promise[Map[Long, ExecutionCounters]], Future[Map[Long, ExecutionCounters]]])] =
           (head :: tail).map{ tw => (tw, cache.getOrLock(conf, tw)) }
         val (weDoOperation, someoneElseDoesOperation) = unwrapListEither(cacheLookup)
@@ -750,7 +652,10 @@ object Execution {
               weDoOperation match {
                 case all @ (h :: tail) =>
                   val futCounters: Future[Map[Long, ExecutionCounters]] =
-                    scheduleToWrites(conf, mode, cache, h._1, tail.map(_._1))
+                    cache.writer
+                      .execute(conf, mode, all.map(_._1))
+                      .map(Map(_))
+
                   // Complete all of the promises we put into the cache
                   // with this future counters set
                   all.foreach {
@@ -763,11 +668,12 @@ object Execution {
                   Future.successful(Map.empty)
               }
 
-            failFastZip(otherResult, localFlowDefCountersFuture).map {
-              case (lCounters, fdCounters) =>
-                val summedCounters = (fdCounters :: lCounters).reduce(_ ++ _)
-                (fn(conf, mode), summedCounters)
-            }
+            val bothFutures = failFastZip(otherResult, localFlowDefCountersFuture)
+            for {
+              (lCounters, fdCounters) <- bothFutures
+              t <- result((conf, mode, cache.writer, cec))
+              summedCounters = (fdCounters :: lCounters).reduce(_ ++ _)
+            } yield (t, summedCounters)
         }
       }))
     }
@@ -780,15 +686,11 @@ object Execution {
      */
     override def zip[U](that: Execution[U]): Execution[(T, U)] =
       that match {
-        case WriteExecution(h, t, otherFn, tempFiles) =>
-          val newFn = { (conf: Config, mode: Mode) =>
-            (fn(conf, mode), otherFn(conf, mode))
+        case WriteExecution(h, t, other) =>
+          val newFn = { tup: (Config, Mode, Writer, ConcurrentExecutionContext) =>
+            (failFastZip(result(tup), other(tup))(tup._4))
           }
-          val newTempFilesFn = { (conf: Config, mode: Mode) =>
-            tempFilesToCleanup(conf, mode) ++ tempFiles(conf, mode)
-          }
-
-          WriteExecution(head, h :: t ::: tail, newFn, newTempFilesFn)
+          WriteExecution(head, h :: t ::: tail, newFn)
         case o => Zipped(this, that)
       }
 
@@ -847,14 +749,17 @@ object Execution {
   def fromFn(fn: (Config, Mode) => FlowDef): Execution[Unit] =
     FlowDefExecution(fn)
 
-  /**
-   * Creates an Execution to do a write
-   *
-   * This variant allows the user to supply a method using the config and mode to build a new
-   * type U for the resultant execution.
-   */
-  private[scalding] def write[T, U](pipe: TypedPipe[T], sink: TypedSink[T], generatorFn: (Config, Mode) => U): Execution[U] =
-    WriteExecution(SimpleWrite(pipe, sink), Nil, generatorFn)
+  def forceToDisk[T](t: TypedPipe[T]): Execution[TypedPipe[T]] =
+    WriteExecution(
+      ToWrite.Force(t),
+      Nil,
+      { case (conf, mode, w, cec) => w.getForced(conf, mode, t)(cec) })
+
+  def toIterable[T](t: TypedPipe[T]): Execution[Iterable[T]] =
+    WriteExecution(
+      ToWrite.ToIterable(t),
+      Nil,
+      { case (conf, mode, w, cec) => w.getIterable(conf, mode, t)(cec) })
 
   /**
    * The simplest form, just sink the typed pipe into the sink and get a unit execution back
@@ -863,18 +768,9 @@ object Execution {
     write(pipe, sink, ())
 
   private[scalding] def write[T, U](pipe: TypedPipe[T], sink: TypedSink[T], presentType: => U): Execution[U] =
-    WriteExecution(SimpleWrite(pipe, sink), Nil, { (_: Config, _: Mode) => presentType })
-
-  /**
-   * Here we allow both the targets to write and the sources to be generated from the config and mode.
-   * This allows us to merge things looking for the config and mode without using flatmap.
-   */
-  private[scalding] def write[T, U](fn: (Config, Mode) => (TypedPipe[T], TypedSink[T]), generatorFn: (Config, Mode) => U,
-                                    tempFilesToCleanup: (Config, Mode) => Set[String] = (_, _) => Set()): Execution[U] =
-    WriteExecution(PreparedWrite({ (cfg: Config, m: Mode) =>
-      val r = fn(cfg, m)
-      SimpleWrite(r._1, r._2)
-    }), Nil, generatorFn, tempFilesToCleanup)
+    WriteExecution(ToWrite.SimpleWrite(pipe, sink),
+      Nil,
+      { tup => Future(presentType)(tup._4) })
 
   /**
    * Convenience method to get the Args

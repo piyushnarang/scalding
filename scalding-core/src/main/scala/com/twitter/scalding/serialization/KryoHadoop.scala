@@ -52,6 +52,8 @@ class KryoHadoop(@transient config: Config) extends KryoInstantiator {
     newK.addDefaultSerializer(classOf[com.twitter.algebird.HLL], new HLLSerializer)
     // Don't serialize Boxed instances using Kryo.
     newK.addDefaultSerializer(classOf[com.twitter.scalding.serialization.Boxed[_]], new ThrowingSerializer)
+    newK.addDefaultSerializer(classOf[com.twitter.scalding.typed.TypedPipe[_]], new SerializeAsUnit)
+    newK.addDefaultSerializer(classOf[com.twitter.scalding.typed.ReduceStep[_, _, _]], new SerializeAsUnit)
 
     // Register every boxed class so they are given cascading tokens
     for {
